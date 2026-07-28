@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Research Agent UI — Cognito, API Gateway REST API with async proxy pattern.
+  Uses DynamoDB to store task results, avoiding API Gateway 30s timeout.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: research-agent-ui
+  MicroVmImageName:
+    Type: String
+    Default: research-agent
+    Description: MicroVM image name used to launch new instances.
+  MicroVmExecutionRoleArn:
+    Type: String
+    Description: Execution role ARN for the MicroVM (from backend stack output).
+  Boto3LayerArn:
+    Type: String
+    Description: >
+      ARN of the Lambda layer with updated boto3 that includes lambda-microvms.
+      Build with infrastructure/build-layer.sh.
+  AllowedOrigin:
+    Type: String
+    Description: CORS allowed origin (must be set to your frontend domain, e.g. http://localhost:5173)
+
+Resources:
+
+  # ─── Cognito ──────────────────────────────────────────────────────────────────
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ─── KMS Key (shared encryption for logs, DynamoDB, Lambda env vars) ────────
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for Research Agent UI resources
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: AllowKeyUsage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: AllowLambdaService
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  # ─── DLQ (Dead Letter Queue for failed Worker invocations) ────────────────────
+
+  WorkerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # ─── DynamoDB ─────────────────────────────────────────────────────────────────
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+
+  # ─── API Gateway REST API ─────────────────────────────────────────────────────
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuth
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  ResearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: research
+
+  ResearchPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ResearchResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitFunction.Arn}/invocations'
+
+  ResearchOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ResearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  TasksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: tasks
+
+  TaskIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref TasksResource
+      PathPart: '{taskId}'
+
+  TaskGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TaskIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.taskId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PollFunction.Arn}/invocations'
+
+  TaskOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TaskIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ResearchPost
+      - ResearchOptions
+      - TaskGet
+      - TaskOptions
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: INFO
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status"}'
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-usage-plan'
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref ApiStage
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 20
+
+  # ─── Submit Lambda ────────────────────────────────────────────────────────────
+
+  SubmitFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SubmitPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WorkerFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WorkerDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  SubmitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-submit'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SubmitFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt WorkerDLQ.Arn
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          WORKER_FUNCTION: !Ref WorkerFunction
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import time
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TASKS_TABLE"])
+          lambda_client = boto3.client("lambda")
+          WORKER_FUNCTION = os.environ["WORKER_FUNCTION"]
+          CORS_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
+
+          def handler(event, context):
+              body = json.loads(event.get("body", "{}"))
+              task = body.get("task", "")
+              session_id = body.get("sessionId")
+
+              if not task:
+                  return {
+                      "statusCode": 400,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": CORS_ORIGIN},
+                      "body": json.dumps({"error": "task is required"}),
+                  }
+
+              task_id = str(uuid.uuid4())
+              ttl = int(time.time()) + 3600
+
+              table.put_item(Item={
+                  "taskId": task_id,
+                  "status": "PENDING",
+                  "task": task,
+                  "sessionId": session_id or "",
+                  "ttl": ttl,
+              })
+
+              lambda_client.invoke(
+                  FunctionName=WORKER_FUNCTION,
+                  InvocationType="Event",
+                  Payload=json.dumps({"taskId": task_id, "task": task, "sessionId": session_id}),
+              )
+
+              return {
+                  "statusCode": 202,
+                  "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": CORS_ORIGIN},
+                  "body": json.dumps({"taskId": task_id, "status": "PENDING"}),
+              }
+
+  SubmitPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SubmitFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*'
+
+  # ─── Poll Lambda ──────────────────────────────────────────────────────────────
+
+  PollFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PollPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WorkerDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  PollFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-poll'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PollFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt WorkerDLQ.Arn
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TASKS_TABLE"])
+          CORS_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
+
+          def handler(event, context):
+              task_id = event.get("pathParameters", {}).get("taskId", "")
+              if not task_id:
+                  return {
+                      "statusCode": 400,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": CORS_ORIGIN},
+                      "body": json.dumps({"error": "taskId required"}),
+                  }
+
+              resp = table.get_item(Key={"taskId": task_id})
+              item = resp.get("Item")
+
+              if not item:
+                  return {
+                      "statusCode": 404,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": CORS_ORIGIN},
+                      "body": json.dumps({"error": "Task not found"}),
+                  }
+
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": CORS_ORIGIN},
+                  "body": json.dumps({
+                      "taskId": item["taskId"],
+                      "status": item["status"],
+                      "task": item.get("task", ""),
+                      "sessionId": item.get("sessionId", ""),
+                      "report": item.get("report", ""),
+                      "error": item.get("error", ""),
+                  }),
+              }
+
+  PollPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PollFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*'
+
+  # ─── Worker Lambda (long-running, async) ──────────────────────────────────────
+
+  WorkerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDB
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt TasksTable.Arn
+              - Sid: DLQ
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WorkerDLQ.Arn
+              - Sid: KMS
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+              - Sid: ManageMicroVMs
+                Effect: Allow
+                Action:
+                  - lambda:ListMicrovms
+                  - lambda:GetMicrovm
+                  - lambda:RunMicrovm
+                  - lambda:CreateMicrovmAuthToken
+                  - lambda:PassNetworkConnector
+                Resource: '*'
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref MicroVmExecutionRoleArn
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-worker'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WorkerFunctionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt WorkerDLQ.Arn
+      Layers:
+        - !Ref Boto3LayerArn
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          MICROVM_IMAGE_NAME: !Ref MicroVmImageName
+          MICROVM_EXECUTION_ROLE_ARN: !Ref MicroVmExecutionRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import urllib.request
+          import urllib.error
+          import boto3
+
+          IMAGE_NAME = os.environ["MICROVM_IMAGE_NAME"]
+          EXECUTION_ROLE_ARN = os.environ["MICROVM_EXECUTION_ROLE_ARN"]
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          ACCOUNT_ID = EXECUTION_ROLE_ARN.split(":")[4]
+          IMAGE_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:microvm-image:{IMAGE_NAME}"
+
+          microvm_client = boto3.client("lambda-microvms", region_name=REGION)
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TASKS_TABLE"])
+
+          def find_running_microvm():
+              resp = microvm_client.list_microvms(imageIdentifier=IMAGE_ARN)
+              for vm in resp.get("items", []):
+                  if vm["state"] in ("RUNNING", "SUSPENDED"):
+                      detail = microvm_client.get_microvm(microvmIdentifier=vm["microvmId"])
+                      return detail["microvmId"], detail["endpoint"]
+              return None, None
+
+          def launch_microvm():
+              resp = microvm_client.run_microvm(
+                  imageIdentifier=IMAGE_ARN,
+                  executionRoleArn=EXECUTION_ROLE_ARN,
+                  idlePolicy={
+                      "maxIdleDurationSeconds": 300,
+                      "suspendedDurationSeconds": 60,
+                      "autoResumeEnabled": True,
+                  },
+                  maximumDurationInSeconds=28800,
+                  ingressNetworkConnectors=[
+                      f"arn:aws:lambda:{REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS"
+                  ],
+                  egressNetworkConnectors=[
+                      f"arn:aws:lambda:{REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+                  ],
+              )
+              microvm_id = resp["microvmId"]
+              for _ in range(20):
+                  time.sleep(3)
+                  vm = microvm_client.get_microvm(microvmIdentifier=microvm_id)
+                  if vm.get("state") == "RUNNING":
+                      return microvm_id, vm["endpoint"]
+                  if vm.get("state") in ("TERMINATED", "FAILED"):
+                      raise RuntimeError(f"MicroVM failed: {vm.get('stateReason', 'unknown')}")
+              raise RuntimeError("MicroVM did not reach RUNNING state in time")
+
+          def get_auth_token(microvm_id):
+              resp = microvm_client.create_microvm_auth_token(
+                  microvmIdentifier=microvm_id,
+                  expirationInMinutes=30,
+                  allowedPorts=[{"allPorts": {}}],
+              )
+              return resp["authToken"]["X-aws-proxy-auth"]
+
+          def handler(event, context):
+              task_id = event["taskId"]
+              task = event["task"]
+              session_id = event.get("sessionId")
+
+              try:
+                  microvm_id, endpoint = find_running_microvm()
+                  if not microvm_id:
+                      microvm_id, endpoint = launch_microvm()
+
+                  token = get_auth_token(microvm_id)
+
+                  url = f"https://{endpoint}/research"
+                  payload = json.dumps({"task": task, "sessionId": session_id}).encode()
+                  req = urllib.request.Request(
+                      url,
+                      data=payload,
+                      headers={"Content-Type": "application/json", "X-aws-proxy-auth": token},
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(req, timeout=600) as resp:
+                      result = json.loads(resp.read().decode())
+
+                  table.update_item(
+                      Key={"taskId": task_id},
+                      UpdateExpression="SET #s = :s, report = :r, sessionId = :sid",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={
+                          ":s": "COMPLETED",
+                          ":r": result.get("report", ""),
+                          ":sid": result.get("sessionId", session_id or ""),
+                      },
+                  )
+
+              except Exception as e:
+                  table.update_item(
+                      Key={"taskId": task_id},
+                      UpdateExpression="SET #s = :s, #e = :e",
+                      ExpressionAttributeNames={"#s": "status", "#e": "error"},
+                      ExpressionAttributeValues={":s": "FAILED", ":e": str(e)},
+                  )
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ApiEndpoint:
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'

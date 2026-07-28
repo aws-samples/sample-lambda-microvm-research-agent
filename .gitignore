@@ -1,0 +1,35 @@
+# Build artifacts
+research-agent/agent-package.zip
+
+# Installers
+*.pkg
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ash/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# OS
+Thumbs.db
+
+# Node
+node_modules/
+dist/
+boto3-layer.zip
