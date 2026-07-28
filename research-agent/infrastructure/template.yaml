@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Research Agent Infrastructure — ECR repository, IAM roles, S3 buckets, and
+  AgentCore Gateway for the autonomous research agent on Lambda MicroVMs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: research-agent
+    Description: Name prefix for all resources.
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock model ID the agent is allowed to invoke.
+
+Resources:
+
+  # ─── S3 Buckets ───────────────────────────────────────────────────────────────
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "This IS the access logging destination bucket"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 30
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: artifacts-access-logs/
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub '${ArtifactsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowBuildRoleRead
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt BuildRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${ArtifactsBucket.Arn}/*'
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: results-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowExecutionRoleWrite
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ExecutionRole.Arn
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${ResultsBucket.Arn}/*'
+
+  # ─── IAM Roles ────────────────────────────────────────────────────────────────
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: BuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ArtifactsBucket.Arn}/*'
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: AgentExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteResults
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ResultsBucket.Arn}/*'
+              - Sid: InvokeBedrock
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-sonnet-4-6'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-*::foundation-model/anthropic.claude-sonnet-4-6'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0'
+              - Sid: InvokeAgentCoreGateway
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt AgentCoreGateway.GatewayArn
+              - Sid: Logging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # ─── AgentCore Gateway ────────────────────────────────────────────────────────
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AgentCoreGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${ProjectName}-gateway'
+      AuthorizerType: AWS_IAM
+      ProtocolType: MCP
+      RoleArn: !GetAtt GatewayRole.Arn
+
+Outputs:
+
+  ArtifactsBucketName:
+    Description: S3 bucket for deployment artifacts
+    Value: !Ref ArtifactsBucket
+
+  ResultsBucketName:
+    Description: S3 bucket for agent research reports
+    Value: !Ref ResultsBucket
+
+  BuildRoleArn:
+    Description: IAM role ARN for MicroVM image builds
+    Value: !GetAtt BuildRole.Arn
+
+  ExecutionRoleArn:
+    Description: IAM role ARN for running MicroVMs
+    Value: !GetAtt ExecutionRole.Arn
+
+  AgentCoreGatewayId:
+    Description: AgentCore Gateway identifier
+    Value: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  AgentCoreGatewayUrl:
+    Description: AgentCore Gateway MCP endpoint URL
+    Value: !GetAtt AgentCoreGateway.GatewayUrl
