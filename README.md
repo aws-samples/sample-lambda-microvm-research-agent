@@ -112,7 +112,7 @@ Replace `<YOUR_ACCOUNT_ID>` with your 12-digit AWS account ID. You only need to 
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── Chat.tsx          # Chat interface with session support
-│   │   │   ├── Login.tsx         # Sign in / sign up / forgot password
+│   │   │   ├── Login.tsx         # Sign in / forgot password
 │   │   │   └── MessageBubble.tsx # Markdown-rendered message display
 │   │   ├── api.ts                # Async submit + poll client
 │   │   ├── config.ts             # Environment-based config (from .env)
@@ -219,7 +219,38 @@ aws cloudformation describe-stacks \
 
 You'll get: `UserPoolId`, `UserPoolClientId`, `ApiEndpoint`.
 
-### Step 8: Configure and Run the UI
+### Step 8: Create a User
+
+Self-service sign-up is disabled on the Cognito User Pool (`AllowAdminCreateUserOnly: true`), so accounts must be created by an administrator. This prevents anyone who discovers your app client ID from registering and consuming Bedrock and MicroVM capacity on your account.
+
+```bash
+POOL_ID=$(aws cloudformation describe-stacks \
+  --stack-name research-agent-ui \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" \
+  --output text --region us-east-1)
+
+aws cognito-idp admin-create-user \
+  --user-pool-id "$POOL_ID" \
+  --username user@example.com \
+  --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true \
+  --message-action SUPPRESS \
+  --region us-east-1
+
+aws cognito-idp admin-set-user-password \
+  --user-pool-id "$POOL_ID" \
+  --username user@example.com \
+  --password '<StrongPassword>' \
+  --permanent \
+  --region us-east-1
+```
+
+The `--permanent` flag matters: without it the user lands in `FORCE_CHANGE_PASSWORD` state and sign-in returns a new-password challenge that the UI doesn't handle. `--message-action SUPPRESS` skips the invitation email since you're setting the password directly.
+
+Passwords must satisfy the pool policy: 8+ characters with uppercase, lowercase, and a number.
+
+You can also create users from the console under Amazon Cognito → User pools → your pool → Users → Create user.
+
+### Step 9: Configure and Run the UI
 
 Create `research-agent-ui/.env` from the template:
 
@@ -227,7 +258,7 @@ Create `research-agent-ui/.env` from the template:
 cp .env.example .env
 ```
 
-Edit `.env` with the values from step 7:
+Edit `.env` with the values from Step 7:
 
 ```env
 VITE_COGNITO_USER_POOL_ID=us-east-1_XXXXXXXX
@@ -244,7 +275,7 @@ npm run dev
 
 App available at `http://localhost:5173`.
 
-### Step 9: Build for Production
+### Step 10: Build for Production
 
 ```bash
 npm run build
@@ -369,6 +400,7 @@ cd research-agent && ./deploy.sh infra
 
 - **Cognito authentication**: All API requests require a valid Cognito ID token
 - **Cognito authorizer**: API Gateway validates tokens before invoking Lambdas
+- **Admin-only user creation**: Self-service sign-up is disabled, so accounts can't be created by anyone who finds the app client ID
 - **No hardcoded secrets**: Frontend config loaded from environment variables (.env gitignored)
 - **Explicit CORS origin**: AllowedOrigin is a required parameter (no wildcard default)
 - **No public endpoints**: AgentCore Gateway uses AWS_IAM auth; MicroVM requires auth token
@@ -412,6 +444,8 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more inform
 - **Image build fails**: Check logs with `./deploy.sh create-image`.
 - **MicroVM terminates immediately**: Check runtime logs in CloudWatch `/aws/lambda-microvms/research-agent`.
 - **UI auth errors**: Confirm `.env` values match CloudFormation outputs.
+- **Sign-up fails / "not allowed"**: Expected. Self-service sign-up is disabled — create the user with `admin-create-user` as shown in [Step 8](#step-8-create-a-user).
+- **Sign-in appears to do nothing**: The user is likely in `FORCE_CHANGE_PASSWORD` state. Run `admin-set-user-password` with `--permanent` to clear it.
 - **CORS errors**: Ensure `AllowedOrigin` parameter matches your frontend URL exactly.
 - **Task stuck in PENDING**: Check Worker Lambda logs: `aws logs tail /aws/lambda/research-agent-ui-worker --since 10m --region us-east-1`
 - **Task FAILED**: Poll the task to see the error: `GET /tasks/{taskId}` returns an `error` field.

@@ -36,7 +36,8 @@ Resources:
       UsernameAttributes:
         - email
       AdminCreateUserConfig:
-        AllowAdminCreateUserOnly: false
+        # Self-service sign-up disabled: users must be created by an administrator
+        AllowAdminCreateUserOnly: true
       Policies:
         PasswordPolicy:
           MinimumLength: 8
